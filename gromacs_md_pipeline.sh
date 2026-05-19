@@ -1,42 +1,35 @@
 #!/usr/bin/env bash
+set -euo pipefail
+
 # =============================================================================
 # GROMACS MD SIMULATION PIPELINE
 # Author      : Ritika Bist
 # Description : Single-script GROMACS MD pipeline for Linux/HPC
-#               Runs pdb2gmx → solvation → ions → EM → NVT → NPT → MD → analysis
 # Usage       : bash gromacs_md_pipeline.sh
 # Edit        : Only change PROTEIN below to match your input PDB (no extension)
 # =============================================================================
 
-set -euo pipefail
-
-# =============================================================================
-# USER CONFIGURATION — only section you need to edit
-# =============================================================================
-
-PROTEIN="pdb_file" #without extension
+PROTEIN="ZmPHT1_1_mutant_H" #no extension
 GMX="gmx_mpi"
 
-# =============================================================================
-# DIRECTORY LAYOUT
-# All outputs are separated by stage. Nothing dumps into root.
-#
-# project/
-# ├── input/           ← your PDB goes here
-# ├── mdp/             ← all .mdp files go here
-# ├── output/
-# │   ├── topology/    ← topol.top, .itp files, processed.gro
-# │   ├── em/          ← energy minimization
-# │   ├── nvt/         ← NVT equilibration
-# │   ├── npt/         ← NPT equilibration
-# │   ├── md/          ← production MD trajectory
-# │   └── analysis/    ← RMSD, Rg, and other analysis outputs
-# └── logs/            ← per-stage stdout + stderr logs
-# =============================================================================
+# --- File names from PROTEIN ---
+INPUT_PDB="${PROTEIN}.pdb"
+PROCESSED="${PROTEIN}_processed.gro"
+NEWBOX="${PROTEIN}_newbox.gro"
+SOLV="${PROTEIN}_solv.gro"
+SOLV_IONS="${PROTEIN}_solv_ions.gro"
 
-INPUT_DIR="input"
-MDP_DIR="mdp"
-TOPO_DIR="output/topology"
+# --- MDP files (should be in current directory) ---
+IONS_MDP="ions.mdp"
+MINIM_MDP="minim.mdp"
+NVT_MDP="nvt.mdp"
+NPT_MDP="npt.mdp"
+MD_MDP="md.mdp"
+
+# --- Output directories ---
+# topol.top, posre.itp, and intermediate .gro files stay in root
+# GROMACS resolves #include paths relative to where topol.top lives
+# Only mdrun outputs and logs go into subdirectories
 EM_DIR="output/em"
 NVT_DIR="output/nvt"
 NPT_DIR="output/npt"
@@ -45,27 +38,9 @@ ANALYSIS_DIR="output/analysis"
 LOG_DIR="logs"
 
 # =============================================================================
-# DERIVED FILENAMES — do not edit below unless you know what you are doing
-# =============================================================================
-
-INPUT_PDB="${INPUT_DIR}/${PROTEIN}.pdb"
-PROCESSED="${TOPO_DIR}/${PROTEIN}_processed.gro"
-NEWBOX="${TOPO_DIR}/${PROTEIN}_newbox.gro"
-SOLV="${TOPO_DIR}/${PROTEIN}_solv.gro"
-SOLV_IONS="${TOPO_DIR}/${PROTEIN}_solv_ions.gro"
-TOPOL="${TOPO_DIR}/topol.top"
-
-IONS_MDP="${MDP_DIR}/ions.mdp"
-MINIM_MDP="${MDP_DIR}/minim.mdp"
-NVT_MDP="${MDP_DIR}/nvt.mdp"
-NPT_MDP="${MDP_DIR}/npt.mdp"
-MD_MDP="${MDP_DIR}/md.mdp"
-
-# =============================================================================
 # UTILITIES
 # =============================================================================
 
-# Print a timestamped banner for each major stage
 stage_banner() {
     echo ""
     echo "============================================================"
@@ -74,7 +49,6 @@ stage_banner() {
     echo "============================================================"
 }
 
-# Hard-stop if a required file is missing or empty
 check_file() {
     if [[ ! -f "$1" || ! -s "$1" ]]; then
         echo "ERROR: Required file missing or empty: $1"
@@ -82,9 +56,7 @@ check_file() {
     fi
 }
 
-# grompp wrapper: first attempt without -maxwarn; retries with -maxwarn 1
-# GROMACS sometimes throws non-fatal warnings that block preprocessing.
-# Using -maxwarn 1 selectively avoids silencing everything globally.
+# grompp wrapper: tries without -maxwarn first, retries with -maxwarn 1 if needed
 run_grompp() {
     if ! "$GMX" grompp "$@" 2>/dev/null; then
         echo "  WARNING: grompp failed without -maxwarn. Retrying with -maxwarn 1 ..."
@@ -93,17 +65,14 @@ run_grompp() {
 }
 
 # =============================================================================
-# SETUP — create directory structure before anything runs
+# SETUP
 # =============================================================================
 
 echo "Setting up directory structure ..."
-mkdir -p "$INPUT_DIR" "$MDP_DIR" \
-         "$TOPO_DIR" "$EM_DIR" "$NVT_DIR" "$NPT_DIR" "$MD_DIR" "$ANALYSIS_DIR" \
-         "$LOG_DIR"
+mkdir -p "$EM_DIR" "$NVT_DIR" "$NPT_DIR" "$MD_DIR" "$ANALYSIS_DIR" "$LOG_DIR"
 
 # =============================================================================
-# PRE-FLIGHT CHECKS — verify all required input files exist before starting
-# Fail fast here so you don't waste 20 minutes only to hit a missing .mdp
+# PRE-FLIGHT
 # =============================================================================
 
 echo "Running pre-flight checks ..."
@@ -113,10 +82,9 @@ done
 echo "All required input files found. Starting pipeline."
 
 # =============================================================================
-# STAGE 1 — pdb2gmx
-# Assigns force field and builds the molecular topology.
-# Interactive selections piped in: 13 = CHARMM36, 1 = TIP3P water model
-# Outputs: processed .gro file + topol.top
+# STAGE 1 — pdb2gmx: assign force field and build topology
+# Selection: 13 (CHARMM36) -> 1 (TIP3P)
+# topol.top and posre.itp written to root — must stay here for include resolution
 # =============================================================================
 
 stage_banner 1 "pdb2gmx — Force field assignment and topology"
@@ -124,17 +92,15 @@ stage_banner 1 "pdb2gmx — Force field assignment and topology"
 printf "13\n1\n" | "$GMX" pdb2gmx \
     -f "$INPUT_PDB" \
     -o "$PROCESSED" \
-    -p "$TOPOL" \
+    -p topol.top \
     >> "${LOG_DIR}/stage1_pdb2gmx.log" 2>&1
 
 check_file "$PROCESSED"
-check_file "$TOPOL"
-echo "Stage 1 done → $PROCESSED"
+check_file "topol.top"
+echo "Stage 1 done: $PROCESSED"
 
 # =============================================================================
-# STAGE 2 — editconf
-# Defines the simulation box: cubic, 1.0 nm padding around the protein.
-# -c centers the protein in the box.
+# STAGE 2 — editconf: create cubic simulation box
 # =============================================================================
 
 stage_banner 2 "editconf — Simulation box construction"
@@ -146,12 +112,10 @@ stage_banner 2 "editconf — Simulation box construction"
     >> "${LOG_DIR}/stage2_editconf.log" 2>&1
 
 check_file "$NEWBOX"
-echo "Stage 2 done → $NEWBOX"
+echo "Stage 2 done: $NEWBOX"
 
 # =============================================================================
-# STAGE 3 — solvate
-# Fills the box with SPC/E water (spc216.gro is GROMACS built-in).
-# Automatically updates topol.top with solvent molecule count.
+# STAGE 3 — solvate: fill box with water
 # =============================================================================
 
 stage_banner 3 "solvate — Filling box with water"
@@ -160,17 +124,15 @@ stage_banner 3 "solvate — Filling box with water"
     -cp "$NEWBOX" \
     -cs spc216.gro \
     -o "$SOLV" \
-    -p "$TOPOL" \
+    -p topol.top \
     >> "${LOG_DIR}/stage3_solvate.log" 2>&1
 
 check_file "$SOLV"
-echo "Stage 3 done → $SOLV"
+echo "Stage 3 done: $SOLV"
 
 # =============================================================================
-# STAGE 4 — grompp + genion
-# Prepares a dummy .tpr for ion insertion, then replaces water molecules
-# with NA+/CL- to neutralize the system charge.
-# genion selection: 13 = SOL group (solvent)
+# STAGE 4 — grompp + genion: add neutralizing ions
+# genion selection: 13 (SOL group)
 # =============================================================================
 
 stage_banner 4 "genion — Adding neutralizing ions"
@@ -178,27 +140,24 @@ stage_banner 4 "genion — Adding neutralizing ions"
 run_grompp \
     -f "$IONS_MDP" \
     -c "$SOLV" \
-    -p "$TOPOL" \
-    -o "${TOPO_DIR}/ions.tpr" \
+    -p topol.top \
+    -o ions.tpr \
     >> "${LOG_DIR}/stage4_grompp_ions.log" 2>&1
 
-check_file "${TOPO_DIR}/ions.tpr"
+check_file "ions.tpr"
 
 echo "13" | "$GMX" genion \
-    -s "${TOPO_DIR}/ions.tpr" \
+    -s ions.tpr \
     -o "$SOLV_IONS" \
-    -p "$TOPOL" \
+    -p topol.top \
     -pname NA -nname CL -neutral \
     >> "${LOG_DIR}/stage4_genion.log" 2>&1
 
 check_file "$SOLV_IONS"
-echo "Stage 4 done → $SOLV_IONS"
+echo "Stage 4 done: $SOLV_IONS"
 
 # =============================================================================
 # STAGE 5 — Energy minimization
-# Relaxes steric clashes introduced during solvation/ion placement.
-# Uses steepest descent as specified in minim.mdp.
-# All EM output files land in output/em/
 # =============================================================================
 
 stage_banner 5 "Energy minimization"
@@ -206,7 +165,7 @@ stage_banner 5 "Energy minimization"
 run_grompp \
     -f "$MINIM_MDP" \
     -c "$SOLV_IONS" \
-    -p "$TOPOL" \
+    -p topol.top \
     -o "${EM_DIR}/em.tpr" \
     >> "${LOG_DIR}/stage5_grompp_em.log" 2>&1
 
@@ -216,12 +175,10 @@ run_grompp \
 for f in "${EM_DIR}/em.edr" "${EM_DIR}/em.gro" "${EM_DIR}/em.log" "${EM_DIR}/em.tpr"; do
     check_file "$f"
 done
-echo "Stage 5 done → ${EM_DIR}/em.gro"
+echo "Stage 5 done: energy minimization"
 
 # =============================================================================
-# STAGE 6 — NVT equilibration
-# Equilibrates temperature at constant volume with position restraints.
-# -r flag passes restraint reference coordinates (same as starting structure).
+# STAGE 6 — NVT equilibration (temperature, position restrained)
 # =============================================================================
 
 stage_banner 6 "NVT equilibration — Temperature"
@@ -230,7 +187,7 @@ run_grompp \
     -f "$NVT_MDP" \
     -c "${EM_DIR}/em.gro" \
     -r "${EM_DIR}/em.gro" \
-    -p "$TOPOL" \
+    -p topol.top \
     -o "${NVT_DIR}/nvt.tpr" \
     >> "${LOG_DIR}/stage6_grompp_nvt.log" 2>&1
 
@@ -239,12 +196,10 @@ run_grompp \
 
 check_file "${NVT_DIR}/nvt.cpt"
 check_file "${NVT_DIR}/nvt.gro"
-echo "Stage 6 done → ${NVT_DIR}/nvt.gro"
+echo "Stage 6 done: NVT equilibration"
 
 # =============================================================================
-# STAGE 7 — NPT equilibration
-# Equilibrates pressure at constant temperature with position restraints.
-# -t passes the NVT checkpoint to continue velocities and thermostat state.
+# STAGE 7 — NPT equilibration (pressure + temperature, position restrained)
 # =============================================================================
 
 stage_banner 7 "NPT equilibration — Pressure"
@@ -254,7 +209,7 @@ run_grompp \
     -c "${NVT_DIR}/nvt.gro" \
     -t "${NVT_DIR}/nvt.cpt" \
     -r "${NVT_DIR}/nvt.gro" \
-    -p "$TOPOL" \
+    -p topol.top \
     -o "${NPT_DIR}/npt.tpr" \
     >> "${LOG_DIR}/stage7_grompp_npt.log" 2>&1
 
@@ -264,13 +219,10 @@ run_grompp \
 for f in "${NPT_DIR}/npt.cpt" "${NPT_DIR}/npt.edr" "${NPT_DIR}/npt.gro"; do
     check_file "$f"
 done
-echo "Stage 7 done → ${NPT_DIR}/npt.gro"
+echo "Stage 7 done: NPT equilibration"
 
 # =============================================================================
 # STAGE 8 — Production MD
-# Unconstrained simulation. No position restraints.
-# -t continues from NPT checkpoint (preserves thermostat/barostat state).
-# Output lands in output/md/
 # =============================================================================
 
 stage_banner 8 "Production MD"
@@ -279,7 +231,7 @@ run_grompp \
     -f "$MD_MDP" \
     -c "${NPT_DIR}/npt.gro" \
     -t "${NPT_DIR}/npt.cpt" \
-    -p "$TOPOL" \
+    -p topol.top \
     -o "${MD_DIR}/md_0_10.tpr" \
     >> "${LOG_DIR}/stage8_grompp_md.log" 2>&1
 
@@ -288,17 +240,13 @@ run_grompp \
 
 check_file "${MD_DIR}/md_0_10.xtc"
 check_file "${MD_DIR}/md_0_10.gro"
-echo "Stage 8 done → ${MD_DIR}/md_0_10.xtc"
-
-echo ""
-echo "Last 30 lines of production MD log:"
+echo "Stage 8 done: production MD"
+echo "Last 30 lines of MD log:"
 tail -n 30 "${MD_DIR}/md_0_10.log"
 
 # =============================================================================
-# STAGE 9 — trjconv: PBC correction
-# Fixes periodic boundary artifacts in the trajectory.
-# Protein is re-centered; whole system is written out.
-# Selection: 1 (Protein, center) → 0 (System, output)
+# STAGE 9 — trjconv: fix PBC artifacts
+# Selection: 1 (Protein, center) -> 0 (System, output)
 # =============================================================================
 
 stage_banner 9 "trjconv — PBC correction"
@@ -311,13 +259,11 @@ printf "1\n0\n" | "$GMX" trjconv \
     >> "${LOG_DIR}/stage9_trjconv.log" 2>&1
 
 check_file "${MD_DIR}/md_0_10_noPBC.xtc"
-echo "Stage 9 done → ${MD_DIR}/md_0_10_noPBC.xtc"
+echo "Stage 9 done: PBC-corrected trajectory"
 
 # =============================================================================
 # STAGE 10 — RMSD (backbone)
-# Measures backbone structural deviation relative to the starting structure.
-# Selection: 4 (Backbone) for both fitting and RMSD calculation.
-# Output: analysis/rmsd_backbone.xvg — plot with xmgrace or Python
+# Selection: 4 (Backbone) -> 4 (Backbone)
 # =============================================================================
 
 stage_banner 10 "RMSD — Backbone"
@@ -329,13 +275,11 @@ printf "4\n4\n" | "$GMX" rms \
     >> "${LOG_DIR}/stage10_rmsd.log" 2>&1
 
 check_file "${ANALYSIS_DIR}/rmsd_backbone.xvg"
-echo "Stage 10 done → ${ANALYSIS_DIR}/rmsd_backbone.xvg"
+echo "Stage 10 done: RMSD -> ${ANALYSIS_DIR}/rmsd_backbone.xvg"
 
 # =============================================================================
 # STAGE 11 — Radius of gyration
-# Tracks overall protein compactness over the trajectory.
 # Selection: 1 (Protein)
-# Output: analysis/gyrate.xvg
 # =============================================================================
 
 stage_banner 11 "Radius of gyration"
@@ -347,10 +291,10 @@ echo "1" | "$GMX" gyrate \
     >> "${LOG_DIR}/stage11_gyrate.log" 2>&1
 
 check_file "${ANALYSIS_DIR}/gyrate.xvg"
-echo "Stage 11 done → ${ANALYSIS_DIR}/gyrate.xvg"
+echo "Stage 11 done: Gyration -> ${ANALYSIS_DIR}/gyrate.xvg"
 
 # =============================================================================
-# PIPELINE SUMMARY
+# SUMMARY
 # =============================================================================
 
 echo ""
@@ -360,10 +304,9 @@ echo "  Protein   : $PROTEIN"
 echo "  Completed : $(date '+%Y-%m-%d %H:%M:%S')"
 echo "================================================================="
 echo ""
-echo "Key output files:"
+echo "Key outputs:"
 ls -lh \
-    "$PROCESSED" \
-    "$SOLV_IONS" \
+    "$PROCESSED" "$SOLV_IONS" \
     "${EM_DIR}/em.gro" \
     "${NVT_DIR}/nvt.gro" \
     "${NPT_DIR}/npt.gro" \
@@ -374,6 +317,6 @@ ls -lh \
     "${ANALYSIS_DIR}/gyrate.xvg" \
     2>/dev/null || true
 echo ""
-echo "Logs are in: ${LOG_DIR}/"
+echo "Logs: ${LOG_DIR}/"
 ls -1 "${LOG_DIR}/"
 echo "================================================================="
